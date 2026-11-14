@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Connecting Vendor Management</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f8fafc; color: #172033; }
+    main { width: min(440px, calc(100% - 40px)); text-align: center; padding: 32px 24px; box-sizing: border-box; }
+    .spinner { width: 28px; height: 28px; border: 3px solid #dbe3ee; border-top-color: #2457a7; border-radius: 50%; margin: 0 auto 18px; animation: spin .8s linear infinite; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    p { color: #64748b; font-size: 14px; line-height: 1.55; margin: 0; }
+    #error { display: none; color: #b42318; margin-top: 14px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="spinner" aria-hidden="true"></div>
+    <h1>Connecting to Vendor Management</h1>
+    <p id="status">Verifying your Khanna Travels CRM session…</p>
+    <p id="error" role="alert"></p>
+  </main>
+  <script>
+    (() => {
+      const allowedOrigins = {{ allowed_origins | tojson }};
+      const status = document.getElementById('status');
+      const error = document.getElementById('error');
+      let exchanged = false;
+
+      function fail(message) {
+        status.textContent = 'Unable to connect to the CRM.';
+        error.textContent = message;
+        error.style.display = 'block';
+        document.querySelector('.spinner').style.display = 'none';
+      }
+
+      window.addEventListener('message', async (event) => {
+        if (event.source !== window.parent || !allowedOrigins.includes(event.origin)) return;
+        if (!event.data || event.data.type !== 'KHANNA_VENDOR_SSO' || typeof event.data.assertion !== 'string') return;
+        if (exchanged) return;
+        exchanged = true;
+        status.textContent = 'Signing you in securely…';
+        try {
+          const response = await fetch('/auth/crm/exchange', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            cache: 'no-store',
+            body: JSON.stringify({ assertion: event.data.assertion })
+          });
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.error || 'Authentication failed.');
+          status.textContent = 'Opening Vendor Management…';
+          window.location.replace('/');
+        } catch (err) {
+          exchanged = false;
+          fail(err && err.message ? err.message : 'Please refresh the CRM page and try again.');
+        }
+      });
+
+      if (window.parent === window) {
+        fail('Please open Vendor Management from inside Khanna Travels CRM.');
+        return;
+      }
+      if (!allowedOrigins.length) {
+        fail('CRM embedding has not been configured yet.');
+        return;
+      }
+      // Notify only the explicitly configured CRM origins. The CRM must then
+      // obtain a one-time assertion from its own authenticated backend.
+      allowedOrigins.forEach(origin => window.parent.postMessage({ type: 'VENDOR_SSO_READY' }, origin));
+      window.setTimeout(() => {
+        if (!exchanged && error.style.display !== 'block') {
+          status.textContent = 'Waiting for secure CRM authentication…';
+        }
+      }, 5000);
+    })();
+  </script>
+</body>
+</html>

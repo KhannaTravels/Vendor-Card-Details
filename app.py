@@ -12,13 +12,14 @@ from pathlib import Path
 
 from flask import (
     Flask, Response, abort, flash, jsonify, redirect, render_template,
-    request, send_from_directory, url_for,
+    request, send_from_directory, url_for, session, make_response,
 )
 from PIL import Image, ImageOps
 
 import ai_interpreter
 import db
 import sheet_sync
+import auth_sso
 from ai_interpreter import (
     AIUnavailable, interpret_vendor_images, interpret_vendor_text, local_extract,
 )
@@ -50,14 +51,14 @@ app = Flask(__name__)
 
 
 def _secret_key():
-    """Random key kept in a local file (not uploaded to GitHub)."""
-    if os.getenv("SECRET_KEY"):
-        return os.getenv("SECRET_KEY")
+    """Require an explicitly provisioned secret for deployed environments."""
+    configured = os.getenv("SECRET_KEY", "").strip()
+    if configured:
+        if len(configured.encode("utf-8")) < 32:
+            raise RuntimeError("SECRET_KEY must contain at least 32 characters")
+        return configured
     if os.getenv("VERCEL"):
-        # Same key on every Vercel server, derived from the private settings
-        import hashlib
-        seed = (os.getenv("APP_PASSWORD", "") + os.getenv("GEMINI_API_KEY", "")).encode()
-        return hashlib.sha256(b"vendor-cards:" + seed).hexdigest()
+        raise RuntimeError("SECRET_KEY must be configured in the Vercel environment")
     path = DATA_DIR / ".flask_secret"
     if not path.exists():
         import secrets
@@ -66,23 +67,215 @@ def _secret_key():
 
 
 app.secret_key = _secret_key()
+app.config.update(
+    SESSION_COOKIE_NAME="__Host-vendor_session",
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_PARTITIONED=True,
+    SESSION_COOKIE_PATH="/",
+    SESSION_COOKIE_DOMAIN=None,
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
+)
 
-# Optional password for the whole app. Set APP_PASSWORD=... in the .env file
-# (needed when the app is opened over the internet, e.g. through a tunnel).
+# Existing direct-access password remains available for top-level access.
+# A CRM SSO session is the preferred authentication method inside the iframe.
 APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
+SSO_SECRET = os.getenv("CRM_SSO_SECRET", "").strip()
+SSO_ISSUER = os.getenv("CRM_SSO_ISSUER", "khanna-travels-crm").strip()
+SSO_AUDIENCE = os.getenv("CRM_SSO_AUDIENCE", "khanna-vendor-management").strip()
+SSO_MAX_LIFETIME = min(max(int(os.getenv("CRM_SSO_MAX_LIFETIME", "60")), 15), 120)
+
+# Routes that may be reached before authentication only to bootstrap SSO.
+SSO_BOOTSTRAP_ENDPOINTS = {"sso_iframe", "sso_exchange", "static"}
+
+# Permissions are enforced server-side for CRM-authenticated users.
+# Direct Basic Auth retains the existing application's administrator-like behavior.
+ROUTE_PERMISSIONS = {
+    "index": ("vendors.view",),
+    "vendor_detail": {"GET": ("vendors.view",), "POST": ("vendors.edit", "vendors.review")},
+    "vendor_new": ("vendors.create",),
+    "vendor_delete": ("vendors.delete",),
+    "card_image": ("vendors.view",),
+    "scan": ("vendors.scan",),
+    "scan_card_api": ("vendors.scan",),
+    "scan_job_status": ("vendors.scan",),
+    "scan_done": ("vendors.scan",),
+    "export_page": ("vendors.export",),
+    "export_csv": ("vendors.export",),
+    "export_xlsx": ("vendors.export",),
+    "api_vendors": ("vendors.view",),
+    "api_vendor": ("vendors.view",),
+    "import_page": ("vendors.import",),
+    "import_preview": ("vendors.import",),
+    "import_template": ("vendors.import",),
+    "settings_page": ("vendors.settings",),
+    "download_backup": ("vendors.backup",),
+    "sync_page": ("vendors.sync",),
+    "sync_signin": ("vendors.sync",),
+    "sync_signin_status": ("vendors.sync",),
+    "sync_signout": ("vendors.sync",),
+    "sync_run": ("vendors.sync",),
+    "retry_ai": ("vendors.scan",),
+}
+
+
+def _is_crm_session():
+    return bool(session.get("crm_user_id"))
+
+
+def _has_permission(permission):
+    permissions = session.get("crm_permissions") or []
+    return permission in permissions
+
+
+def _is_valid_basic_auth():
+    if not APP_PASSWORD:
+        return False
+    auth = request.authorization
+    return bool(auth and hmac.compare_digest(
+        (auth.password or "").encode("utf-8"), APP_PASSWORD.encode("utf-8")
+    ))
 
 
 @app.before_request
-def require_password():
-    if not APP_PASSWORD:
+def require_authentication_and_authorization():
+    endpoint = request.endpoint
+    if endpoint in SSO_BOOTSTRAP_ENDPOINTS or endpoint is None:
         return None
-    auth = request.authorization
-    if auth and hmac.compare_digest((auth.password or "").encode(), APP_PASSWORD.encode()):
-        return None
-    return Response(
-        "Please sign in to Vendor Card Scanner.", 401,
-        {"WWW-Authenticate": 'Basic realm="Vendor Card Scanner", charset="UTF-8"'},
+
+    # Browser form submissions are same-origin to Flask inside the iframe.
+    # Reject cross-site state-changing requests; SSO exchange is separately
+    # protected by a signed, single-use assertion.
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and endpoint != "sso_exchange":
+        expected_origin = auth_sso.request_origin(request)
+        origin = request.headers.get("Origin", "").rstrip("/")
+        if origin:
+            if origin != expected_origin:
+                return jsonify({"error": "Cross-origin request rejected"}), 403
+        else:
+            # Older browsers may omit Origin on some form posts. In that case
+            # require a same-origin Referer; fail closed if neither is present.
+            referer = request.headers.get("Referer", "")
+            parsed = auth_sso.url_origin(referer)
+            if parsed != expected_origin:
+                return jsonify({"error": "Request origin could not be verified"}), 403
+
+    crm_authenticated = _is_crm_session()
+    if not crm_authenticated and not _is_valid_basic_auth():
+        # Do not silently run an internet-facing app with authentication off.
+        if not APP_PASSWORD:
+            return Response("Vendor Management direct login is not configured.", 503)
+        if request.headers.get("Sec-Fetch-Dest") == "iframe":
+            return redirect(url_for("sso_iframe"))
+        return Response(
+            "Please sign in to Vendor Card Scanner.", 401,
+            {"WWW-Authenticate": 'Basic realm="Vendor Card Scanner", charset="UTF-8"'},
+        )
+
+    # CRM identities receive least-privilege authorization. The shared legacy
+    # Basic Auth password remains an administrator-equivalent fallback.
+    if crm_authenticated:
+        if endpoint == "sso_logout":
+            return None
+        required = ROUTE_PERMISSIONS.get(endpoint)
+        if required is None:
+            return jsonify({"error": "This CRM-integrated route is not authorized."}), 403
+        if isinstance(required, dict):
+            required = required.get(request.method, ())
+        if not required or not all(_has_permission(permission) for permission in required):
+            return jsonify({"error": "You do not have permission to perform this action."}), 403
+    return None
+
+
+@app.after_request
+def set_security_headers(response):
+    origins = auth_sso.configured_origins()
+    if origins:
+        frame_ancestors = " ".join(sorted(origins))
+    else:
+        frame_ancestors = "'none'"
+    existing_csp = response.headers.get("Content-Security-Policy", "").strip()
+    if existing_csp:
+        directives = [part.strip() for part in existing_csp.split(";") if part.strip()]
+        directives = [part for part in directives if not part.lower().startswith("frame-ancestors")]
+        directives.append(f"frame-ancestors {frame_ancestors}")
+        if not any(part.lower().startswith("object-src") for part in directives):
+            directives.append("object-src 'none'")
+        if not any(part.lower().startswith("base-uri") for part in directives):
+            directives.append("base-uri 'self'")
+        response.headers["Content-Security-Policy"] = "; ".join(directives)
+    else:
+        response.headers["Content-Security-Policy"] = f"frame-ancestors {frame_ancestors}; object-src 'none'; base-uri 'self'"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers.pop("X-Frame-Options", None)
+    return response
+
+
+@app.get("/auth/iframe", endpoint="sso_iframe")
+def sso_iframe():
+    """Non-sensitive iframe bootstrap shell; no vendor data is rendered here."""
+    origins = auth_sso.configured_origins()
+    return render_template("sso_iframe.html", allowed_origins=sorted(origins))
+
+
+@app.post("/auth/crm/exchange", endpoint="sso_exchange")
+def sso_exchange():
+    """Exchange a CRM-signed one-time assertion for a Flask session."""
+    if not SSO_SECRET:
+        return jsonify({"error": "CRM SSO is not configured"}), 503
+    # This fetch is initiated by the iframe document itself, so the HTTP
+    # Origin is the Flask origin, not the CRM parent origin. The parent-origin
+    # check happens in the iframe postMessage handler; the signed assertion is
+    # the server-side proof of CRM authentication.
+    origin = request.headers.get("Origin", "").rstrip("/")
+    if origin != auth_sso.request_origin(request):
+        return jsonify({"error": "Cross-origin exchange request rejected"}), 403
+    body = request.get_json(silent=True) or {}
+    token = body.get("assertion") if isinstance(body, dict) else None
+    try:
+        identity = auth_sso.verify_assertion(
+            token, secret=SSO_SECRET, issuer=SSO_ISSUER, audience=SSO_AUDIENCE,
+            max_lifetime=SSO_MAX_LIFETIME,
+        )
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO crm_sso_used_tokens (jti, expires_at) VALUES (?, ?)",
+                (identity["jti"], identity["exp"]),
+            )
+            # Opportunistic cleanup keeps the replay table bounded.
+            conn.execute("DELETE FROM crm_sso_used_tokens WHERE expires_at < ?", (int(time.time()) - 300,))
+    except auth_sso.SSOError as error:
+        return jsonify({"error": str(error)}), 401
+    except Exception as error:
+        # A duplicate jti or database failure must fail closed.
+        app.logger.warning("CRM SSO assertion rejected: %s", type(error).__name__)
+        return jsonify({"error": "SSO assertion could not be accepted"}), 401
+
+    session.clear()
+    session.permanent = True
+    session["crm_user_id"] = identity["sub"]
+    session["crm_user_name"] = identity["name"]
+    session["crm_user_email"] = identity["email"]
+    session["crm_permissions"] = identity["permissions"]
+    session["crm_authenticated_at"] = int(time.time())
+    response = make_response(jsonify({"ok": True, "user": identity["name"]}))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/auth/logout", endpoint="sso_logout")
+def sso_logout():
+    session.clear()
+    response = make_response(redirect(url_for("sso_iframe")))
+    response.delete_cookie(
+        app.config["SESSION_COOKIE_NAME"], path="/", secure=True,
+        httponly=True, samesite="None",
     )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB per upload
 
 @app.template_filter("localtime")
@@ -170,6 +363,14 @@ def init_db():
                 synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # SSO replay protection: a CRM launch assertion may be consumed once.
+        # This is an authentication table, not a second vendor database.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS crm_sso_used_tokens (
+                jti TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL
+            )
+        """)
 
 
 # ------------------------------------------------------------ settings
@@ -235,7 +436,7 @@ def apply_settings():
 
 
 def current_user():
-    return get_settings()["profile_name"].strip() or None
+    return (session.get("crm_user_name") or get_settings()["profile_name"].strip() or None)
 
 
 def _row_to_vendor(row):
@@ -397,7 +598,7 @@ def _query_vendors(search=""):
 
 def store_file(name, path):
     """Online version: keep a copy of a file in the database."""
-    if db.IS_POSTGRES:
+    if db.IS_ONLINE:
         with db.connect() as conn:
             conn.execute(
                 "INSERT INTO files (name, data) VALUES (?, ?) "
@@ -408,7 +609,7 @@ def store_file(name, path):
 
 def restore_file(name, path):
     """Online version: bring a stored file back to this server's disk."""
-    if not db.IS_POSTGRES:
+    if not db.IS_ONLINE:
         return False
     with db.connect() as conn:
         row = conn.execute("SELECT data FROM files WHERE name = ?", (name,)).fetchone()
@@ -420,7 +621,7 @@ def restore_file(name, path):
 
 
 def forget_files(prefix):
-    if db.IS_POSTGRES:
+    if db.IS_ONLINE:
         with db.connect() as conn:
             conn.execute("DELETE FROM files WHERE name LIKE ?", (prefix + "%",))
 
@@ -431,7 +632,7 @@ def prepare_image(file_storage):
     with Image.open(file_storage.stream) as original:
         image = ImageOps.exif_transpose(original).convert("RGB")
         image.thumbnail((2000, 2000))
-        image.save(destination, "JPEG", quality=88 if db.IS_POSTGRES else 92)
+        image.save(destination, "JPEG", quality=88 if db.IS_ONLINE else 92)
     store_file(f"cards/{destination.name}", destination)
     return destination
 
@@ -1180,8 +1381,8 @@ def settings_page():
     images = [p for p in UPLOAD_DIR.glob("*.jpg")]
     info = {
         "api_key": ("•••• " + key[-4:]) if len(key) > 8 else "",
-        "db_path": "Online database (Postgres)" if db.IS_POSTGRES else str(DB_PATH),
-        "db_size": 0 if db.IS_POSTGRES else (DB_PATH.stat().st_size if DB_PATH.exists() else 0),
+        "db_path": db.label() if db.IS_ONLINE else str(DB_PATH),
+        "db_size": 0 if db.IS_ONLINE else (DB_PATH.stat().st_size if DB_PATH.exists() else 0),
         "upload_path": str(UPLOAD_DIR),
         "image_count": len(images),
         "image_size": sum(p.stat().st_size for p in images),
@@ -1225,6 +1426,8 @@ def layout_data():
     return {
         "app_settings": settings,
         "nav_counts": {"total": total, "to_review": to_review},
+        "crm_allowed_origins": sorted(auth_sso.configured_origins()),
+        "crm_sso_user": bool(session.get("crm_user_id")),
     }
 
 

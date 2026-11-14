@@ -74,5 +74,38 @@
 </div>
 
 {% block scripts %}{% endblock %}
+{% if crm_sso_user %}
+<script>
+(() => {
+    const allowedOrigins = {{ crm_allowed_origins | tojson }};
+    window.addEventListener('message', async (event) => {
+        if (event.source !== window.parent || !allowedOrigins.includes(event.origin)) return;
+        const message = event.data || {};
+        if (message.type === 'KHANNA_CRM_LOGOUT') {
+            try {
+                await fetch('{{ url_for("sso_logout") }}', {
+                    method: 'POST', credentials: 'same-origin', cache: 'no-store'
+                });
+            } finally {
+                window.location.replace('{{ url_for("sso_iframe") }}');
+            }
+            return;
+        }
+        if (message.type === 'KHANNA_VENDOR_SSO_REFRESH' && typeof message.assertion === 'string') {
+            try {
+                const response = await fetch('{{ url_for("sso_exchange") }}', {
+                    method: 'POST', credentials: 'same-origin', cache: 'no-store',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ assertion: message.assertion })
+                });
+                if (!response.ok) throw new Error('SSO refresh rejected');
+            } catch (_) {
+                window.location.replace('{{ url_for("sso_iframe") }}');
+            }
+        }
+    });
+})();
+</script>
+{% endif %}
 </body>
 </html>
