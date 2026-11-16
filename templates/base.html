@@ -11,7 +11,7 @@
 {% macro icon(name) %}<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{{ icons[name] | safe }}</svg>{% endmacro %}
 {% macro nav_link(endpoint, label, icon_name, active_endpoints=()) %}
     {% set active = request.endpoint == endpoint or request.endpoint in active_endpoints %}
-    <a href="{{ url_for(endpoint) }}" class="side-link{{ ' active' if active }}">
+    <a href="{{ url_for(endpoint) }}" class="top-link{{ ' active' if active }}">
         {{ icon(icon_name) }}<span>{{ label }}</span>{{ caller() if caller }}
     </a>
 {% endmacro %}
@@ -25,41 +25,25 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-<div class="shell">
-
-    <aside class="sidebar" id="sidebar">
-        <a class="side-logo" href="{{ url_for('index') }}" title="Vendor Cards - home">
-            <img src="{{ url_for('static', filename='logo.png') }}" alt="Khanna Travels - Holidays Redefined">
-        </a>
-        <div class="side-app-name">Vendor Card Scanner</div>
-
-        <nav class="side-nav">
-            <div class="side-section">Vendors</div>
+<header class="topbar">
+    <div class="topbar-inner">
+        <nav class="top-nav" aria-label="Main menu">
             {% call nav_link('index', 'All vendors', 'vendors', ('vendor_detail',)) %}
                 <span class="side-count">{{ nav_counts.total }}</span>
             {% endcall %}
-            {{ nav_link('scan', 'Scan card', 'scan') }}
             {{ nav_link('vendor_new', 'Add manually', 'add') }}
-
-            <div class="side-section">Data</div>
-            {{ nav_link('import_page', 'Import', 'import', ('import_preview',)) }}
             {{ nav_link('export_page', 'Export', 'export') }}
             {{ nav_link('sync_page', 'Excel sync', 'sync') }}
         </nav>
 
-        <div class="side-bottom">
-            {{ nav_link('settings_page', 'Settings', 'settings') }}
-        </div>
-    </aside>
+        {% set settings_active = request.endpoint == 'settings_page' %}
+        <a class="top-settings{{ ' active' if settings_active }}" href="{{ url_for('settings_page') }}"
+           title="Settings" aria-label="Settings">{{ icon('settings') }}<span>Settings</span></a>
+    </div>
+</header>
 
+<div class="shell">
     <div class="main">
-        <header class="mobile-bar">
-            <button class="menu-button" type="button" aria-label="Open menu"
-                    onclick="document.body.classList.toggle('menu-open')">{{ icon('menu') }}</button>
-            <img class="mobile-logo" src="{{ url_for('static', filename='logo.png') }}" alt="Khanna Travels">
-        </header>
-        <div class="menu-backdrop" onclick="document.body.classList.remove('menu-open')"></div>
-
         <main class="page">
             {% with messages = get_flashed_messages(with_categories=true) %}
                 {% for category, message in messages %}
